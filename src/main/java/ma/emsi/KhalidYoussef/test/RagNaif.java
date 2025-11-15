@@ -7,13 +7,19 @@ import dev.langchain4j.data.document.parser.apache.tika.ApacheTikaDocumentParser
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.memory.ChatMemory;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.embedding.onnx.allminilml6v2.AllMiniLmL6V2EmbeddingModel;
 import dev.langchain4j.model.googleai.GoogleAiGeminiChatModel;
 import dev.langchain4j.model.output.Response;
+import dev.langchain4j.rag.content.retriever.ContentRetriever;
+import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
+import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
 import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
+import ma.emsi.KhalidYoussef.Assistant;
 
 import javax.print.Doc;
 import javax.swing.text.html.parser.DocumentParser;
@@ -22,6 +28,7 @@ import java.net.URL;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.Scanner;
 
 public class RagNaif {
     public static void main(String[] args) throws URISyntaxException {
@@ -39,6 +46,7 @@ public class RagNaif {
                 .build();
 
         //Phase 1 enregistrement des embeddings
+        System.out.println("\n--- Phase 1 : Ingestion ---");
         ApacheTikaDocumentParser documentParser = new ApacheTikaDocumentParser();
         Path pdf = Paths.get("src/main/resources/LangChain4j.pdf");
         Document document = FileSystemDocumentLoader.loadDocument(pdf, documentParser);
@@ -57,6 +65,41 @@ public class RagNaif {
         System.out.println("Génération et stockage des embeddings...");
         embeddingStore.addAll(embeddings, segments);
         System.out.println("Phase 1 - Ingestion terminée.");
+
+        //Phase 2: utilisation des embeddings pour répondre aux questions.
+        System.out.println("\n--- Phase 2 : Récupération et Conversation ---");
+        ContentRetriever contentRetriever = EmbeddingStoreContentRetriever.builder()
+                .embeddingStore(embeddingStore)
+                .embeddingModel(embeddingModel)
+                // Configuration demandée : 2 résultats les plus pertinents
+                .maxResults(2)
+                // Configuration demandée : score minimal de 0.5
+                .minScore(0.5)
+                .build();
+        System.out.println("ContentRetriever configuré.");
+        ChatMemory chatMemory = MessageWindowChatMemory.withMaxMessages(10);
+        Assistant assistant = AiServices.builder(Assistant.class)
+                .chatMemory(chatMemory)
+                .chatModel(model)
+                .contentRetriever(contentRetriever)
+                .build();
+        System.out.println("Assistant prêt. Vous pouvez commencer à poser des questions.");
+        try (Scanner scanner = new Scanner(System.in)) {
+            while (true) {
+                System.out.println("\n==================================================");
+                System.out.println("Posez votre question");
+                String question = scanner.nextLine();
+
+                if ("bye".equalsIgnoreCase(question)) break;
+                if (question.isBlank()) continue;
+
+                String reponse = assistant.chat(question);
+
+                System.out.println("--------------------------------------------------");
+                System.out.println("Assistant : " + reponse);
+                System.out.println("==================================================");
+            }
+        }
     }
 
 }
