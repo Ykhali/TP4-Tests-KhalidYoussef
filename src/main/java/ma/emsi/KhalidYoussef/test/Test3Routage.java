@@ -16,7 +16,6 @@ import dev.langchain4j.rag.DefaultRetrievalAugmentor;
 import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
 import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
 import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.service.AiServices;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -24,49 +23,160 @@ import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
 import ma.emsi.KhalidYoussef.Assistant;
 
 import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Scanner;
-import java.util.List;
+import java.util.*;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class Test3Routage {
 
-    // Active logger pour voir le routage (LLM queries)
     private static void configureLogger() {
         Logger packageLogger = Logger.getLogger("dev.langchain4j");
         packageLogger.setLevel(Level.FINE);
 
         ConsoleHandler handler = new ConsoleHandler();
         handler.setLevel(Level.FINE);
-
         packageLogger.setUseParentHandlers(false);
         packageLogger.addHandler(handler);
 
-        System.out.println("--- Logging LangChain4j activé (niveau FINE) ---");
+        System.out.println("--- Logging LangChain4j activé ---");
     }
 
     private static void ingest(Path path, EmbeddingStore<TextSegment> store, EmbeddingModel embModel) {
         Document document = FileSystemDocumentLoader.loadDocument(path, new ApacheTikaDocumentParser());
-        List<TextSegment> segments = DocumentSplitters.recursive(300, 100).split(document);
+        List<TextSegment> segments = DocumentSplitters.recursive(400, 100).split(document);
 
         if (segments == null || segments.isEmpty()) {
             System.out.println("Aucun segment trouvé pour : " + path);
             return;
         }
 
+        System.out.println("Début de l'ingestion pour : " + path + " (" + segments.size() + " segments)");
         for (TextSegment segment : segments) {
-            // Note : selon ta version de langchain4j, embModel.embed(...) peut renvoyer un objet différent.
-            // Ici on suppose embModel.embed(segment.text()).content() renvoie un Embedding.
-            Embedding embedding = embModel.embed(segment.text()).content();
+            try {
+                Embedding embedding = embModel.embed(segment.text()).content();
+                store.add(embedding, segment);
 
-            // selon la signature du store, utilise store.add(embedding, segment) ou store.addAll(...)
-            store.add(embedding, segment);
+            } catch (Exception e) {
+                System.err.println("  Erreur lors de l'embedding du segment "  + e.getMessage());
+                System.err.println("  Nouvelle tentative dans 3 secondes...");
+                try {
+                    Embedding embedding = embModel.embed(segment.text()).content();
+                    store.add(embedding, segment);
+                } catch (Exception e2) {
+                    System.err.println("Échec après nouvelle tentative. Segment ignoré.");
+                }
+            }
         }
 
-        System.out.println("Ingest terminé pour : " + path + " (segments = " + segments.size() + ")");
+        System.out.println("✅ Ingest terminé pour : " + path);
+    }
+    static class RouterDecisionCapture {
+        private String selectedRetriever;
+        private String justification;
+
+        public void setDecision(String retriever, String justification) {
+            this.selectedRetriever = retriever;
+            this.justification = justification;
+        }
+
+        public String getSelectedRetriever() {
+            return selectedRetriever;
+        }
+
+        public String getJustification() {
+            return justification;
+        }
+
+        public void reset() {
+            selectedRetriever = null;
+            justification = null;
+        }
+    }
+    static class CustomQueryRouter implements QueryRouter {
+        private final ChatModel chatModel;
+        private final Map<ContentRetriever, String> descriptions;
+        private final RouterDecisionCapture decisionCapture;
+
+        public CustomQueryRouter(ChatModel chatModel,
+                                 Map<ContentRetriever, String> descriptions,
+                                 RouterDecisionCapture decisionCapture) {
+            this.chatModel = chatModel;
+            this.descriptions = descriptions;
+            this.decisionCapture = decisionCapture;
+        }
+
+        @Override
+        public Collection<ContentRetriever> route(dev.langchain4j.rag.query.Query query) {
+            StringBuilder promptBuilder = new StringBuilder();
+            promptBuilder.append("Tu es un système de routage intelligent. Analyse la question suivante et choisis ");
+            promptBuilder.append("le retriever le plus approprié parmi les options disponibles.\n\n");
+
+            int index = 1;
+            Map<Integer, ContentRetriever> indexToRetriever = new HashMap<>();
+
+            promptBuilder.append("Options disponibles:\n");
+            for (Map.Entry<ContentRetriever, String> entry : descriptions.entrySet()) {
+                promptBuilder.append(index).append(") ").append(entry.getValue()).append("\n");
+                indexToRetriever.put(index, entry.getKey());
+                index++;
+            }
+
+            promptBuilder.append("\nQuestion de l'utilisateur: ").append(query.text()).append("\n\n");
+            promptBuilder.append("Réponds UNIQUEMENT avec le format suivant:\n");
+            promptBuilder.append("RETRIEVER: [numéro du retriever choisi]\n");
+            promptBuilder.append("JUSTIFICATION: [explication claire et concise de ton choix en 1-2 phrases]");
+
+            String promptComplet = promptBuilder.toString();
+            System.out.println("\n" + "=".repeat(80));
+            System.out.println("PROMPT DE ROUTAGE ENVOYÉ AU LLM");
+            System.out.println("=".repeat(80));
+            System.out.println(promptComplet);
+            System.out.println("=".repeat(80) + "\n");
+
+            String llmResponse = "";
+            try {
+                // Appel simple au ChatModel (compatible avec votre version)
+                llmResponse = chatModel.chat(promptComplet);
+            } catch (Exception e) {
+                System.err.println("Erreur lors de l'appel au LLM pour le routage: " + e.getMessage());
+                return List.of(descriptions.keySet().iterator().next());
+            }
+
+            String selectedRetriever = "Inconnu";
+            String justification = "Aucune justification fournie";
+            ContentRetriever chosen = null;
+
+            String[] lines = llmResponse.split("\n");
+            for (String line : lines) {
+                if (line.startsWith("RETRIEVER:")) {
+                    String retrieverNum = line.substring("RETRIEVER:".length()).trim();
+                    try {
+                        int num = Integer.parseInt(retrieverNum);
+                        chosen = indexToRetriever.get(num);
+                        selectedRetriever = "Retriever " + num;
+                    } catch (NumberFormatException e) {
+                        System.err.println("Erreur de parsing du numéro de retriever: " + retrieverNum);
+                    }
+                } else if (line.startsWith("JUSTIFICATION:")) {
+                    justification = line.substring("JUSTIFICATION:".length()).trim();
+                }
+            }
+
+            decisionCapture.setDecision(selectedRetriever, justification);
+            System.out.println("    DÉCISION DU ROUTER    ");
+            System.out.println("==========================================");
+            System.out.println("Retriever choisi: " + selectedRetriever);
+            System.out.println("Justification: " + justification);
+            System.out.println("==========================================\n");
+
+            if (chosen != null) {
+                return List.of(chosen);
+            } else {
+                System.err.println("Erreur: Impossible de déterminer le retriever, utilisation du premier par défaut");
+                return List.of(descriptions.keySet().iterator().next());
+            }
+        }
     }
 
     public static void main(String[] args) {
@@ -82,7 +192,7 @@ public class Test3Routage {
         ChatModel chatModel = GoogleAiGeminiChatModel.builder()
                 .apiKey(apiKey)
                 .modelName("gemini-2.5-flash")
-                .temperature(0.3)
+                .temperature(0.2)
                 .build();
 
         // Embedding model (Gemini embeddings / Google embeddings)
@@ -91,16 +201,18 @@ public class Test3Routage {
                 .modelName("text-embedding-004")
                 .build();
 
-        // Mémoire du chat (facultative mais demandée par l'énoncé)
+        // Mémoire du chat
         ChatMemory chatMemory = MessageWindowChatMemory.withMaxMessages(10);
 
         // PHASE 1 : ingestion — 2 EmbeddingStores séparés
         EmbeddingStore<TextSegment> storeCours = new InMemoryEmbeddingStore<>();
         EmbeddingStore<TextSegment> storeAutre = new InMemoryEmbeddingStore<>();
 
-        // Adapte les chemins si nécessaire (ou utilise getResource si tu préfères ressources du classpath)
+        System.out.println("\nDébut de l'ingestion des documents...\n");
+
         ingest(Path.of("src/main/resources/FinetuningEtRAG.pdf"), storeCours, embeddingModel);
         ingest(Path.of("src/main/resources/dynamiqueDesGroupes.pdf"), storeAutre, embeddingModel);
+
 
         // PHASE 2 : création des ContentRetrievers (un par store)
         ContentRetriever retrieverCours = EmbeddingStoreContentRetriever.builder()
@@ -119,11 +231,19 @@ public class Test3Routage {
 
         // Descriptions (Map<ContentRetriever, String>) — l'input lu par le LLM pour décider
         Map<ContentRetriever, String> descriptions = new HashMap<>();
-        descriptions.put(retrieverCours, "Documents sur le RAG, fine-tuning et architectures d'IA.");
-        descriptions.put(retrieverAutre, "Documents sur la dynamique des groupe et les 3 pères fondateurs");
+        descriptions.put(retrieverCours,
+                "Documents sur le RAG, fine-tuning et architectures d'IA. Exemples de questions adaptées : "
+                        + "'Qu'est-ce que le fine-tuning ?', 'Comment fonctionne Retrieval-Augmented Generation ?', "
+                        + "'Quels sont les avantages du RAG ?'");
+        descriptions.put(retrieverAutre,
+                "Documents sur la dynamique des groupes (théories, influence sociale, 3 pères fondateurs). "
+                        + "Exemples : 'Quels sont les stades de formation d'un groupe ?', 'Quelles sont les théories de Tuckman ?'");
 
-        // QueryRouter basé sur le LLM (Gemini)
-        QueryRouter router = new LanguageModelQueryRouter(chatModel, descriptions);
+        // Capture pour les décisions du router
+        RouterDecisionCapture decisionCapture = new RouterDecisionCapture();
+
+        // QueryRouter personnalisé avec capture de justification
+        QueryRouter router = new CustomQueryRouter(chatModel, descriptions, decisionCapture);
 
         // RetrievalAugmentor qui utilisera le QueryRouter pour décider quelles sources interroger
         RetrievalAugmentor augmentor = DefaultRetrievalAugmentor.builder()
@@ -138,10 +258,14 @@ public class Test3Routage {
                 .build();
 
         // Boucle interactive
+        System.out.println("\n=============================================================");
+        System.out.println("     Assistant RAG avec Routage Intelligent Prêt           ");
+        System.out.println("     Tapez 'fin', 'exit', 'quitter' ou 'bye' pour terminer     ");
+        System.out.println("===============================================================\n");
+
         try (Scanner scanner = new Scanner(System.in)) {
-            System.out.println("Assistant prêt. Pose des questions: ");
             while (true) {
-                System.out.print("[USER] > ");
+                System.out.print("\n💬 [USER] > ");
                 String question = scanner.nextLine();
                 if (question == null) break;
                 question = question.trim();
@@ -153,13 +277,27 @@ public class Test3Routage {
                     break;
                 }
 
-                // Appel à l'assistant.
-                String reponse = assistant.chat(question);
+                // Reset de la capture
+                decisionCapture.reset();
 
-                System.out.println("[ASSISTANT] : " + reponse);
+                // Appel à l'assistant (le router sera appelé automatiquement)
+                try {
+                    String reponse = assistant.chat(question);
+                    System.out.println("\n🤖 [ASSISTANT] : " + reponse);
+
+                    // Affichage récapitulatif de la décision
+                    if (decisionCapture.getSelectedRetriever() != null) {
+                        System.out.println("\n📊 Récapitulatif: " + decisionCapture.getSelectedRetriever() +
+                                " utilisé → " + decisionCapture.getJustification());
+                    }
+                } catch (Exception e) {
+                    System.err.println("  Erreur lors de l'appel à l'assistant : " + e.getMessage());
+                    e.printStackTrace();
+                }
             }
         }
 
-        System.out.println("Fin du TestRoutage.");
+        System.out.println("\n👋 Fin du TestRoutage. Au revoir!");
+        System.exit(0);
     }
 }
